@@ -240,11 +240,15 @@
     backdrop.textContent = "";
     const panel = h("div", { class: "am-panel" });
     const running = !!state;
+    // 自更新提示：hook 已应用新版本、本会话还在跑旧版本时
+    const upd = state?.update;
+    const updNote = running && upd?.version && upd.version !== state.version
+      ? ` · 🆕 已更新到 v${upd.version}（重启会话生效）` : "";
     panel.appendChild(h("div", { class: "am-head" },
       memoryIcon(),
       h("h3", { text: "记忆" }),
       h("span", { class: `am-dot${running ? "" : " off"}` }),
-      h("span", { class: "am-status", text: running ? "服务正常" : loadError ?? "服务未运行" }),
+      h("span", { class: "am-status", text: (running ? "服务正常" : loadError ?? "服务未运行") + updNote }),
       h("button", { class: "am-x", text: "✕", onclick: closePanel })));
 
     const body = h("div", { class: "am-body" });

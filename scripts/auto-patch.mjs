@@ -11,10 +11,11 @@
  * 任何一步失败都不阻塞会话启动（exit 0）。
  *
  * 手动模式：
- *   node auto-patch.mjs --status      查看注入/服务/存储状态
- *   node auto-patch.mjs --force       强制重新注入
- *   node auto-patch.mjs --uninstall   还原 desktop-dist 并停掉 sidecar
- *   其余参数：--dist <desktop-dist目录> --home <KIMI_CODE_HOME> --no-spawn
+ *   node auto-patch.mjs --status        查看注入/服务/存储状态
+ *   node auto-patch.mjs --force         强制重新注入
+ *   node auto-patch.mjs --check-update  立即检查并应用自更新（无视 24h 限频）
+ *   node auto-patch.mjs --uninstall     还原 desktop-dist 并停掉 sidecar
+ *   其余参数：--dist <desktop-dist目录> --home <KIMI_CODE_HOME> --no-spawn --no-update
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, copyFileSync } from "node:fs";
@@ -23,16 +24,20 @@ import { homedir } from "node:os";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import * as lib from "./memory-lib.mjs";
+import * as su from "./self-update.mjs";
 
 const SCRIPT_NAME = "auto-memory.js";
 const CONFIG_NAME = "auto-memory.config.json";
 const BACKUP_NAME = "index.html.auto-memory.bak";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const PLUGIN_ROOT = dirname(HERE);
+const REPO = "zaibuchihuoji/auto-memory";
+const startedAt = Date.now();
 const args = process.argv.slice(2);
 const has = (f) => args.includes(f);
 const opt = (n) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : undefined; };
-const quiet = !has("--status") && !has("--uninstall") && !has("--force") && !args.includes("--verbose");
+const quiet = !has("--status") && !has("--uninstall") && !has("--force") && !has("--check-update") && !args.includes("--verbose");
 const say = (m) => { if (!quiet) console.log(m); };
 
 // --- 定位 ------------------------------------------------------------------------
@@ -208,6 +213,18 @@ async function main() {
     console.log(`  回收站:    ${lib.listTrash(root).length} 条 · 负反馈 ${lib.listRejected(root, 99).length} 条`);
     if (sweepSummary) console.log(`  本次维护:  转正 ${sweepSummary.promoted} · 过期 ${sweepSummary.expired} · 下架 ${sweepSummary.violated} · 清理回收站 ${sweepSummary.purged ?? 0} · 注入计数 ${sweepSummary.counted}`);
     console.log(`  当前目录:  ${cwd}`);
+  }
+
+  // 自更新：放最后——上下文已输出、sidecar 已就绪；失败静默、限时预算（self-update.mjs）
+  if (!has("--no-update") && !process.env.AUTO_MEMORY_NO_UPDATE && Date.now() - startedAt < 9000) {
+    try {
+      const r = await su.selfUpdate({
+        repo: REPO, pluginRoot: PLUGIN_ROOT, currentVersion: lib.VERSION,
+        log: say, force: has("--check-update"),
+      });
+      if (r?.applied) say(`auto-memory: 已自动更新到 v${r.version}，下次会话生效`);
+      else if (r?.reason && (has("--check-update") || has("--status"))) say(`auto-memory: 更新检查：${r.latest ?? r.reason}`);
+    } catch {}
   }
 }
 

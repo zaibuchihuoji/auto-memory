@@ -23,10 +23,13 @@
 import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
 import { writeFileSync, existsSync, readFileSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import * as lib from "./memory-lib.mjs";
+import * as su from "./self-update.mjs";
 
 const ROOT = lib.memoryRoot();
+const PLUGIN_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = process.env.AUTO_MEMORY_ASSETS ?? null;
 const CONFIG_NAME = "auto-memory.config.json";
 const PORT_RANGE = [39471, 39482];
@@ -136,7 +139,8 @@ const server = createServer(async (req, res) => {
       const trash = lib.listTrash(ROOT);
       const rejected = lib.listRejected(ROOT, 20);
       const sweepLog = lib.lastSweep(ROOT);
-      return json(res, 200, { ok: true, config: cfg, entries, workspaces, lastWorkspace, injection, trash, rejected, sweepLog, dataDir: ROOT, version: lib.VERSION });
+      const update = su.updateState(PLUGIN_ROOT) ?? null;
+      return json(res, 200, { ok: true, config: cfg, entries, workspaces, lastWorkspace, injection, trash, rejected, sweepLog, update, dataDir: ROOT, version: lib.VERSION });
     }
     if (req.method === "POST" && path === "/config") {
       const patch = await readBody(req);
