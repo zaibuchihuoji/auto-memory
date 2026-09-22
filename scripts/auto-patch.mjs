@@ -63,13 +63,14 @@ function patchHtml(indexPath) {
   const backupPath = join(dirname(indexPath), BACKUP_NAME);
   // 备份内容 = 当前页面去掉本插件注入行，每次打补丁跟随刷新：应用自动更新覆盖
   // index.html、或另一插件（如 usage-union）增删注入后，备份仍是干净基线，
-  // 卸载时不会恢复出过期页面或指向已删除脚本的 ghost 标签
+  // 卸载时不会恢复出过期页面或指向已删除脚本的 ghost 标签。
+  // script 标签带 ?v=版本号：app:// 协议对同 URL 资源有缓存，升级必须换 URL。
   const clean = html.split("\n").filter((l) => !l.includes(SCRIPT_NAME)).join("\n");
   if (!clean.includes("</body>")) throw new Error("index.html 结构异常");
   let cur = null;
   try { cur = readFileSync(backupPath, "utf8"); } catch {}
   if (cur !== clean) writeFileSync(backupPath, clean, "utf8");
-  const scriptTag = `    <script src="/assets/${SCRIPT_NAME}"></script>\n`;
+  const scriptTag = `    <script src="/assets/${SCRIPT_NAME}?v=${lib.VERSION}"></script>\n`;
   writeFileSync(indexPath, clean.replace("</body>", `${scriptTag}</body>`), "utf8");
 }
 
@@ -83,7 +84,8 @@ function injectUI(dist) {
   const stale = !existsSync(runtimePath) || !readFileSync(runtimePath, "utf8").includes(`auto-memory@${lib.VERSION}`);
   if (patched && !stale && !has("--force")) return false;
   writeFileSync(runtimePath, `/* auto-memory@${lib.VERSION} */\n` + template, "utf8");
-  if (!patched || has("--force")) patchHtml(indexPath);
+  // 升级时也重写标签：?v= 随版本变化，绕过 app:// 的脚本缓存
+  patchHtml(indexPath);
   return true;
 }
 
