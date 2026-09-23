@@ -128,7 +128,8 @@ function parseIndex(dir) {
   return out;
 }
 
-function writeIndex(dir, entries) {
+// 导出供 CLI reindex 复用：行格式只此一份，防 CLI 侧复刻漂移
+export function writeIndex(dir, entries) {
   // 索引本体永远不含正文。这里不再截断行数/字符——静默丢弃会造成"写入成功但
   // 条目不可见"的孤儿；预算统一在注入时执行（buildContext 截断 + 超限警告），
   // 超预算时由 addEntry/updateEntry 返回 overBudget 提示 AI 先整理
@@ -256,8 +257,11 @@ export function readEntryParsed(root, id) {
 function parseId(id) {
   const [scope, key, file] = String(id).split("|");
   // 保留文件名必须拒绝：否则 /delete {id:"user||MEMORY.md"} 会把索引本身删进回收站
+  // key 与 file 同等校验：HTTP 传入的 id 不可信，"project|../../..|x.md" 不拦
+  // 会经 join(root, scope, key) 逃出记忆根目录，读/写/删任意路径
   if (!["user", "project", "local"].includes(scope) || !file || file.includes("/") || file.includes("\\") || file.includes("..")
-    || file === INDEX_NAME || file === META_NAME || file.startsWith(".")) {
+    || file === INDEX_NAME || file === META_NAME || file.startsWith(".")
+    || (key && (key.includes("/") || key.includes("\\") || key.includes("..")))) {
     throw new Error("非法条目 id");
   }
   return { scope, key: key || null, file };
@@ -449,7 +453,9 @@ export function listTrash(root) {
 /** 从回收站恢复一条（用户明确恢复 = 认可 → status: active 直接转正） */
 export function restoreEntry(root, trashId) {
   const [tag, scope, key, file] = String(trashId).split("|");
-  if (tag !== "trash" || !["user", "project", "local"].includes(scope) || !file || file.includes("/") || file.includes("\\") || file.includes("..")) {
+  // key 与 file 同等校验：HTTP 传入的 id 不可信，带 ../ 会经 join 逃出 .trash
+  if (tag !== "trash" || !["user", "project", "local"].includes(scope) || !file || file.includes("/") || file.includes("\\") || file.includes("..")
+    || (key && (key.includes("/") || key.includes("\\") || key.includes("..")))) {
     throw new Error("非法回收站 id");
   }
   // user 的回收站文件在 .trash/user/ 下（扁平）；project/local 在 .trash/<scope>/<key>/ 下
@@ -480,11 +486,23 @@ export function restoreEntry(root, trashId) {
 
 /** 彻底删除回收站一条 / 清空 */
 export function purgeTrash(root, trashId = null) {
-  const base = join(root, TRASH_DIR);
-  if (!existsSync(base)) return;
+  // 校验先行（在 existsSync 短路之前）：id 来自 HTTP body，key/file 带 ../
+  // 会逃出 .trash 实现任意文件删除，即使 .trash 还不存在也必须先拒绝
+  let target = null;
   if (trashId) {
     const [tag, scope, key, file] = String(trashId).split("|");
-    if (tag !== "trash") return;
+    // 与 restoreEntry 同一套校验：tag 之外每一段都必须白名单化
+    if (tag !== "trash" || !["user", "project", "local"].includes(scope)
+      || !file || file.includes("/") || file.includes("\\") || file.includes("..")
+      || (key && (key.includes("/") || key.includes("\\") || key.includes("..")))) {
+      throw new Error("非法回收站 id");
+    }
+    target = [scope, key, file];
+  }
+  const base = join(root, TRASH_DIR);
+  if (!existsSync(base)) return;
+  if (target) {
+    const [scope, key, file] = target;
     const fp = join(base, scope, key, file);
     const tmp = join(base, scope, key, `.del-${Date.now()}.md`);
     try { renameSync(fp, tmp); try { rmSync(tmp, { force: true }); } catch {} } catch { try { unlinkSync(fp); } catch {} }
@@ -552,11 +570,6 @@ export function sweep(root, cfg, workspace) {
     { scope: "local", keys: listKeys(root, "local") },
   ];
   const now = Date.now();
-  const rewriteFm = (fp, mut) => {
-    const { meta, body } = parseFrontmatter(readFileSync(fp, "utf8"));
-    mut(meta);
-    writeFileSync(fp, fmText(meta, body), "utf8");
-  };
 
   for (const { scope, keys } of all) {
     for (const k of keys) {
@@ -566,7 +579,7 @@ export function sweep(root, cfg, workspace) {
       for (const e of [...parseIndex(dir)]) {
         const fp = join(dir, e.file);
         if (!existsSync(fp)) continue;
-        const { meta } = parseFrontmatter(readFileSync(fp, "utf8"));
+        const { meta, body } = parseFrontmatter(readFileSync(fp, "utf8"));
 
         // 1) 机械校验（仅自动条目；手动条目由用户背书，不强制 evidence）
         if (meta.origin === "auto" && (meta.status === "probation" || meta.status === undefined) &&
@@ -575,19 +588,21 @@ export function sweep(root, cfg, workspace) {
           result.violated++;
           continue;
         }
-        // 2) 注入计数
+        // 2) 注入计数 + 3) 转正：合并为一次原子重写（逐项分开各写一遍文件，
+        // 且非原子写会让并读方——面板/另一会话的 sweep——拿到半截）
+        let dirty = false;
         if (doCount) {
-          rewriteFm(fp, (m) => { m.sessions = (Number(m.sessions) || 0) + 1; });
-          result.counted++;
           meta.sessions = (Number(meta.sessions) || 0) + 1;
+          result.counted++;
+          dirty = true;
         }
-        // 3) 转正
         if (meta.status === "probation" && (Number(meta.sessions) || 0) >= PROMOTE_AT_SESSIONS) {
-          rewriteFm(fp, (m) => { m.status = "active"; });
+          meta.status = "active";
           result.promoted++;
-          continue;
+          dirty = true;
         }
-        // 4) 过期
+        if (dirty) writeAtomic(fp, fmText(meta, body));
+        // 4) 过期（转正后 status 已是 active，自然跳过）
         if (meta.status === "probation") {
           const created = Date.parse(meta.created ?? "");
           if (Number.isFinite(created) && now - created > PROBATION_DAYS * 86400_000) {

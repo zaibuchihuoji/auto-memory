@@ -22,7 +22,7 @@
  * --home 可指定 KIMI_CODE_HOME。
  */
 
-import { readFileSync, writeFileSync, readdirSync, existsSync, renameSync, unlinkSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import * as lib from "./memory-lib.mjs";
 
@@ -102,6 +102,8 @@ switch (cmd) {
   }
 
   case "add": {
+    // 与面板/sidecar 路径同一约束：总开关关闭时不允许写入
+    if (!lib.loadConfig(ROOT).enabled) fail("记忆功能已关闭（面板总开关），请先开启再写入");
     const title = rest.find((a) => !a.startsWith("--") && a !== opt("--scope") && a !== opt("--type") && a !== opt("--evidence") && a !== opt("--workspace") && a !== opt("--content"));
     if (!title?.trim()) fail("用法：add <标题> [--content 文本] [--scope user|project|local] [--type 偏好|事实|坑] [--evidence 原话] [--auto]");
     const scope = scopeArg(true) ?? "user";
@@ -176,7 +178,7 @@ switch (cmd) {
         }
         for (const f of indexFiles) if (!files.includes(f)) deadLines++;
         total += entries.length;
-        rebuildIndex(dirPath, entries);
+        lib.writeIndex(dirPath, entries);   // 与面板同一份实现，行格式永不漂移
       }
     }
     console.log(`✓ 索引重建完成：共 ${total} 条；回收孤儿 ${orphanFiles} 个，清除死行 ${deadLines} 条`);
@@ -186,19 +188,4 @@ switch (cmd) {
   default:
     console.error("用法：node memory-cli.mjs <list|show|add|forget|move|promote|restore|reindex> …");
     process.exit(1);
-}
-
-/** 重建单个目录的 MEMORY.md（行格式与 memory-lib 内部 writeIndex 一致） */
-function rebuildIndex(dirPath, entries) {
-  const lines = entries.map((e) => `- [${e.title}](${e.file})${e.hook ? ` — ${e.hook}` : ""}`);
-  const fp = join(dirPath, "MEMORY.md");
-  const body = lines.join("\n") + (lines.length ? "\n" : "");
-  const tmp = `${fp}.tmp-${process.pid}`;
-  try {
-    writeFileSync(tmp, body, "utf8");
-    renameSync(tmp, fp);
-  } catch {
-    try { unlinkSync(tmp); } catch {}
-    writeFileSync(fp, body, "utf8");
-  }
 }

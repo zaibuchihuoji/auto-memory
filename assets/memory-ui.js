@@ -560,7 +560,10 @@
     const target = h("div", { class: "am-target" });
     const syncTarget = () => {
       wsRow.style.display = scope === "user" ? "none" : "";
-      const key = String(ws ?? "").replace(/[^a-zA-Z0-9_-]/g, "-");
+      // 与服务端 projectKey 同一套归一（盘符大写 + 非法字符替换），
+      // 否则显示的目录 key 与实际写入的不一致
+      const key = String(ws ?? "").replace(/^([a-z]):/, (m, c) => c.toUpperCase() + ":")
+        .replace(/[^a-zA-Z0-9_-]/g, "-");
       target.textContent = scope === "user"
         ? (editing ? "迁移到：~/.kimi-code/memory/user/（跨项目可见）" : "写入：~/.kimi-code/memory/user/（跨项目可见）")
         : `写入：~/.kimi-code/memory/${scope}/${key || "…"}/（仅该工作区会话可见）`;
@@ -739,6 +742,10 @@
     } catch {}
     setInterval(ensureTab, REATTACH_MS);
     ensureTab();
+    // 低频心跳：sidecar 空闲 30 分钟自退，而面板只在打开时才发请求——长会话
+    // 中途点开面板会看到"服务未运行"。渲染脚本常驻，替面板保活（鉴权请求
+    // 才续命；应用关闭后渲染进程不在，sidecar 照常自退不留后台进程）
+    setInterval(() => { call("/state").catch(() => {}); }, 10 * 60 * 1000);
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);

@@ -25,9 +25,15 @@ import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
 import { writeFileSync, existsSync, readFileSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import * as lib from "./memory-lib.mjs";
 import * as su from "./self-update.mjs";
+
+// 不钉住插件目录：引擎安装/更新要把 managed/auto-memory 整个 rename，任何
+// 进程的 CWD 停在里面都会让它 EBUSY。spawn 已传 cwd:homedir()，这里再兜一层
+// （防 CLI/手动等其它拉起方式把 CWD 留在插件目录）
+try { process.chdir(homedir()); } catch {}
 
 const ROOT = lib.memoryRoot();
 const PLUGIN_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -216,7 +222,9 @@ const server = createServer(async (req, res) => {
 });
 
 server.on("error", (e) => {
-  if (e?.code === "EADDRINUSE" && tryingPort < PORT_RANGE[1]) listen(tryingPort + 1);
+  // 递增上限必须与 ensureSidecar 的探测范围一致（探测 p < PORT_RANGE[1]）：
+  // 绑到范围外的实例永远不会被复用/发现，每次会话都会再拉一个新实例
+  if (e?.code === "EADDRINUSE" && tryingPort + 1 < PORT_RANGE[1]) listen(tryingPort + 1);
   else process.exit(1);
 });
 

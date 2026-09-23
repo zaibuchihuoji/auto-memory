@@ -129,7 +129,40 @@ updated: ${new Date().toISOString()}
   assert(lib.listEntries(root).length === 1, "reindex 回收孤儿条目");
 }
 
-// === 8. 版本号来自 manifest（单一来源） ===
+// === 8. id 寻址路径校验（key 段穿越回归，v0.4.3 修复） ===
+{
+  const root = newRoot();
+  const mustThrow = (fn, m) => {
+    try { fn(); } catch (e) {
+      if (/非法/.test(String(e?.message))) { assert(true, m); return; }
+      assert(false, `${m}（抛了意外的错误：${e?.message}）`);
+    }
+    assert(false, `${m}（未拒绝！）`);
+  };
+  mustThrow(() => lib.readEntry(root, "project|../../..|victim.md"), "readEntry 拒绝 key 段穿越");
+  mustThrow(() => lib.readEntry(root, "project|..\\..\\evil|victim.md"), "readEntry 拒绝反斜杠 key");
+  mustThrow(() => lib.deleteEntry(root, "project|../../..|victim.md", "user"), "deleteEntry 拒绝 key 段穿越");
+  mustThrow(() => lib.updateEntry(root, "project|../../..|victim.md", { title: "evil" }), "updateEntry 拒绝 key 段穿越");
+  mustThrow(() => lib.restoreEntry(root, "trash|project|../../..|victim.md"), "restoreEntry 拒绝 key 段穿越");
+  mustThrow(() => lib.purgeTrash(root, "trash|user|../../..|victim.md"), "purgeTrash 拒绝 key 段穿越");
+  mustThrow(() => lib.purgeTrash(root, "trash|user|..\\..\\evil|victim.md"), "purgeTrash 拒绝反斜杠 key");
+  // 正常路径不受影响
+  lib.addEntry(root, { scope: "user", title: "正常条目", content: "内容" });
+  const e = lib.listEntries(root)[0];
+  assert(lib.readEntry(root, e.id).includes("内容"), "合法 id 仍可读写");
+}
+
+// === 9. ensureSidecar 失败路径不再引用未定义变量（v0.4.2 GitHub 发布版
+//      曾因 anyRunning 在 sidecar 拉起超时时中断整个 hook —— 记忆索引静默不注入） ===
+{
+  const src = readFileSync(join(HERE, "..", "scripts", "auto-patch.mjs"), "utf8");
+  assert(!/\banyRunning\b/.test(src), "auto-patch.mjs 无未定义变量引用（anyRunning 回归）");
+  assert(/hits\.some\(Boolean\)/.test(src), "ensureSidecar 超时路径返回探测结果");
+  assert(/tryingPort \+ 1 < PORT_RANGE\[1\]/.test(readFileSync(join(HERE, "..", "scripts", "sidecar.mjs"), "utf8")),
+    "sidecar 端口递增不越出探测范围");
+}
+
+// === 10. 版本号来自 manifest（单一来源） ===
 {
   const manifest = JSON.parse(readFileSync(join(HERE, "..", "kimi.plugin.json"), "utf8"));
   assert(lib.VERSION === manifest.version, `VERSION 与 manifest 一致 → ${lib.VERSION}`);

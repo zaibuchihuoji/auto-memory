@@ -170,7 +170,9 @@ async function ensureSidecar(dist) {
       if (c.port && await ping(c.port)) return { running: true, port: c.port, spawned: true };
     } catch {}
   }
-  return { running: anyRunning, spawned: true };
+  // 拉起超时（3s 内没就绪）：如实报告 spawned 状态；若引用未定义变量会抛
+  // ReferenceError 中断 main()，把后面的记忆索引注入/sweep 一起带崩
+  return { running: hits.some(Boolean), spawned: true };
 }
 
 async function shutdownSidecar() {

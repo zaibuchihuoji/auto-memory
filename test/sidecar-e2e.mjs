@@ -58,6 +58,21 @@ assert(bad.status === 401, "无 token 401");
 bad = await call("/entry?id=" + encodeURIComponent("user|..|../../evil.md"));
 assert(bad.status === 400, "路径穿越 400");
 
+// key 段穿越回归：file 合法但 key 带 ../ 或 ..\，经 join 会逃出记忆根目录，
+// 读（/entry）/删（/delete）/清（/purge）/恢复（/restore）都必须拒绝
+for (const [ep, body] of [
+  ["/delete", { id: "project|../../..|victim.md" }],
+  ["/update", { id: "project|../../..|victim.md", title: "evil" }],
+  ["/purge", { id: "trash|user|../../..|victim.md" }],
+  ["/purge", { id: "trash|user|..\\..\\evil|victim.md" }],
+  ["/restore", { id: "trash|project|..\\..\\evil|x.md" }],
+]) {
+  bad = await call(ep, { method: "POST", body: JSON.stringify(body) });
+  assert(bad.status === 400, `key 段穿越 ${ep} 400（${body.id.slice(0, 30)}…）`);
+}
+bad = await call("/entry?id=" + encodeURIComponent("project|../../..|victim.md"));
+assert(bad.status === 400, "key 段穿越 GET /entry 400");
+
 j = await call("/delete", { method: "POST", body: JSON.stringify({ id: "project|D--x-demo|测试记忆条目.md" }) });
 assert(j.body.ok, "POST /delete");
 
