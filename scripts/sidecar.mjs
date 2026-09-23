@@ -6,8 +6,9 @@
  * ~/.kimi-code/memory/。仅绑定 127.0.0.1，Bearer token 写入
  * desktop-dist/assets/auto-memory.config.json 供面板获取。
  *
- * 自愈：每 30s 检查 config 文件，若指向别的端口（新版本已接管）则自行退出，
- * 避免旧进程残留。
+ * 自愈：每 30s 检查 config 文件——被别的活实例改写（新版本接管）→ 让位退出；
+ * config 意外丢失或指向死进程 → 重写夺回（连续两轮仍丢才让位，防卸载残留）。
+ * 空闲 30 分钟（应用已关闭，面板/钩子都不再访问）→ 自退，不留后台进程。
  *
  * 端点：
  *   GET  /ping                 → {ok, version}
@@ -33,10 +34,18 @@ const PLUGIN_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = process.env.AUTO_MEMORY_ASSETS ?? null;
 const CONFIG_NAME = "auto-memory.config.json";
 const PORT_RANGE = [39471, 39482];
+const IDLE_EXIT_MS = 30 * 60_000;   // 这么久没有任何已鉴权请求（应用已关闭）→ 自退
 
 let TOKEN = randomBytes(16).toString("hex");
 let PORT = 0;
 let lastWorkspace = null;
+let lastActivityAt = Date.now();
+
+/** 进程存活检查；EPERM 视为活着（别人的进程无权发信号）。 */
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e?.code === "EPERM"; }
+}
 
 function writeClientConfig() {
   if (!ASSETS_DIR) return;
@@ -83,16 +92,23 @@ async function pickPort() {
   return { port: 0, reuse: false };
 }
 
-const CORS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-  "Access-Control-Allow-Headers": "authorization,content-type",
-  "Access-Control-Max-Age": "86400",
-};
+// CORS 只放行桌面应用的自定义协议来源；其他浏览器页面拿不到 ACAO，跨域读被拦
+function corsFor(req) {
+  const origin = req.headers.origin ?? "";
+  if (origin.startsWith("app://")) {
+    return {
+      "Access-Control-Allow-Origin": origin,
+      "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+      "Access-Control-Allow-Headers": "authorization,content-type",
+      "Access-Control-Max-Age": "86400",
+    };
+  }
+  return {};
+}
 
-function json(res, code, obj) {
+function json(req, res, code, obj) {
   const body = JSON.stringify(obj);
-  res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", ...CORS });
+  res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", ...corsFor(req) });
   res.end(body);
 }
 
@@ -119,14 +135,15 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const path = url.pathname;
 
-  if (req.method === "OPTIONS") { res.writeHead(204, CORS); res.end(); return; }
+  if (req.method === "OPTIONS") { res.writeHead(204, corsFor(req)); res.end(); return; }
 
   // /ping 免鉴权（供探测复用）；其余端点校验 Bearer token
   if (path === "/ping") {
-    return json(res, 200, { ok: true, service: "auto-memory", version: lib.VERSION, port: PORT });
+    return json(req, res, 200, { ok: true, service: "auto-memory", version: lib.VERSION, port: PORT });
   }
   const auth = req.headers.authorization ?? "";
-  if (auth !== `Bearer ${TOKEN}`) return json(res, 401, { ok: false, error: "未授权" });
+  if (auth !== `Bearer ${TOKEN}`) return json(req, res, 401, { ok: false, error: "未授权" });
+  lastActivityAt = Date.now();
 
   try {
     if (req.method === "GET" && path === "/state") {
@@ -140,61 +157,61 @@ const server = createServer(async (req, res) => {
       const rejected = lib.listRejected(ROOT, 20);
       const sweepLog = lib.lastSweep(ROOT);
       const update = su.updateState(PLUGIN_ROOT) ?? null;
-      return json(res, 200, { ok: true, config: cfg, entries, workspaces, lastWorkspace, injection, trash, rejected, sweepLog, update, dataDir: ROOT, version: lib.VERSION });
+      return json(req, res, 200, { ok: true, config: cfg, entries, workspaces, lastWorkspace, injection, trash, rejected, sweepLog, update, dataDir: ROOT, version: lib.VERSION });
     }
     if (req.method === "POST" && path === "/config") {
       const patch = await readBody(req);
       const cfg = lib.normalizeConfig({ ...lib.loadConfig(ROOT), ...(patch ?? {}) });
       cfg.scopes = { ...lib.loadConfig(ROOT).scopes, ...(patch?.scopes ?? {}) };
       lib.saveConfig(ROOT, cfg);
-      return json(res, 200, { ok: true, config: cfg });
+      return json(req, res, 200, { ok: true, config: cfg });
     }
     if (req.method === "POST" && path === "/entry") {
       const b = await readBody(req);
-      if (!b?.title || !String(b.title).trim()) return json(res, 400, { ok: false, error: "标题不能为空" });
-      if (!lib.loadConfig(ROOT).enabled) return json(res, 409, { ok: false, error: "记忆功能已关闭" });
+      if (!b?.title || !String(b.title).trim()) return json(req, res, 400, { ok: false, error: "标题不能为空" });
+      if (!lib.loadConfig(ROOT).enabled) return json(req, res, 409, { ok: false, error: "记忆功能已关闭" });
       const r = lib.addEntry(ROOT, b);
-      return json(res, 200, { ok: true, ...r });
+      return json(req, res, 200, { ok: true, ...r });
     }
     if (req.method === "GET" && path === "/entry") {
       const parsed = lib.readEntryParsed(ROOT, url.searchParams.get("id") ?? "");
-      return json(res, 200, { ok: true, content: parsed.content, meta: parsed.meta });
+      return json(req, res, 200, { ok: true, content: parsed.content, meta: parsed.meta });
     }
     if (req.method === "POST" && path === "/update") {
       const b = await readBody(req);
-      if (!b?.id) return json(res, 400, { ok: false, error: "缺少条目 id" });
+      if (!b?.id) return json(req, res, 400, { ok: false, error: "缺少条目 id" });
       const r = lib.updateEntry(ROOT, b.id, b);
-      return json(res, 200, { ok: true, ...r });
+      return json(req, res, 200, { ok: true, ...r });
     }
     if (req.method === "POST" && path === "/delete") {
       const b = await readBody(req);
       // 面板/命令删除都是用户意志 → 记负反馈并进回收站
       lib.deleteEntry(ROOT, b?.id ?? "", "user");
-      return json(res, 200, { ok: true });
+      return json(req, res, 200, { ok: true });
     }
     if (req.method === "POST" && path === "/restore") {
       const b = await readBody(req);
       const r = lib.restoreEntry(ROOT, b?.id ?? "");
-      return json(res, 200, { ok: true, ...r });
+      return json(req, res, 200, { ok: true, ...r });
     }
     if (req.method === "POST" && path === "/purge") {
       const b = await readBody(req);
       lib.purgeTrash(ROOT, b?.id ?? null);
-      return json(res, 200, { ok: true });
+      return json(req, res, 200, { ok: true });
     }
     if (req.method === "POST" && path === "/touch") {
       const b = await readBody(req);
       if (b?.workspace) lastWorkspace = String(b.workspace);
-      return json(res, 200, { ok: true });
+      return json(req, res, 200, { ok: true });
     }
     if (req.method === "POST" && path === "/shutdown") {
-      json(res, 200, { ok: true });
+      json(req, res, 200, { ok: true });
       setTimeout(() => process.exit(0), 100);
       return;
     }
-    json(res, 404, { ok: false, error: "not found" });
+    json(req, res, 404, { ok: false, error: "not found" });
   } catch (err) {
-    json(res, 400, { ok: false, error: String(err?.message ?? err) });
+    json(req, res, 400, { ok: false, error: String(err?.message ?? err) });
   }
 });
 
@@ -208,18 +225,30 @@ function listen(port) {
   server.listen(port, "127.0.0.1", () => {
     PORT = port;
     writeClientConfig();
-    // 自愈守卫：config 被新实例改写（指向别的端口）→ 让位退出；config 被删除
-    // （如卸载流程）→ 连续两次确认后退出，避免版本交替期残留孤儿进程
+    // 空闲自退：面板与钩子都不再访问（应用已关闭）→ 退出，不留后台进程
+    setInterval(() => {
+      if (Date.now() - lastActivityAt > IDLE_EXIT_MS) process.exit(0);
+    }, 60_000).unref();
+    // config 看门狗：pid 判断夺回/让位，替代旧的"端口不一致就自杀"——
+    // 那套逻辑在 config 陈旧时会留下"健康实例 + 坏 config"的死局
     let configMisses = 0;
     setInterval(() => {
       if (!ASSETS_DIR) return;
-      try {
-        const c = JSON.parse(readFileSync(join(ASSETS_DIR, CONFIG_NAME), "utf8"));
-        configMisses = 0;
-        if (c.port && c.port !== PORT) process.exit(0);
-      } catch {
+      let c = null;
+      try { c = JSON.parse(readFileSync(join(ASSETS_DIR, CONFIG_NAME), "utf8")); } catch {}
+      if (!c || typeof c.port !== "number") {
+        // 丢失/损坏：连续两轮仍丢（有人在有意删，如卸载 shutdown 失败的兜底）
+        // → 让位；单次意外丢失（杀软锁文件等）→ 重写夺回
         if (++configMisses >= 2) process.exit(0);
+        writeClientConfig();
+        return;
       }
+      configMisses = 0;
+      if (c.pid === process.pid && c.port === PORT) return;
+      // 别的活实例改写了 config（新版本接管）→ 让位；config 指向死进程（陈旧）
+      // → 重写夺回。pid 复用的误判代价只是多退一次，下次会话自动拉起
+      if (c.port !== PORT && pidAlive(c.pid)) process.exit(0);
+      writeClientConfig();
     }, 30_000).unref();
   });
 }

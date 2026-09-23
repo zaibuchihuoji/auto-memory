@@ -126,7 +126,9 @@
   async function apiClient(force) {
     if (!force && client.port && Date.now() - client.at < 5000) return client;
     try {
-      const j = await (await fetch(`${CONFIG_URL}?t=${Date.now()}`)).json();
+      // 必须带超时：启动初期 sidecar 可能还没写好 config，无超时的 fetch 会
+      // 挂死调用方，面板整个停摆
+      const j = await (await fetch(`${CONFIG_URL}?t=${Date.now()}`, { signal: AbortSignal.timeout(3000) })).json();
       client = { at: Date.now(), port: j?.port ?? 0, token: j?.token ?? "", dataDir: j?.dataDir ?? "" };
     } catch { client = { at: Date.now(), port: 0, token: "" }; }
     return client;

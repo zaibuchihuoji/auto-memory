@@ -1,7 +1,7 @@
 {
   "$schema": "https://kimi.com/schemas/kimi.plugin.schema.json",
   "name": "auto-memory",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "给 Kimi Code Desktop 加上跨会话持久记忆：AI 自动沉淀偏好与项目结论，设置页新增「记忆」管理面板（开关 / scope / 搜索 / 删除）。",
   "keywords": [
     "memory",

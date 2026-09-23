@@ -18,7 +18,7 @@
  *   其余参数：--dist <desktop-dist目录> --home <KIMI_CODE_HOME> --no-spawn --no-update
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, copyFileSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, statSync, renameSync, unlinkSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { spawn } from "node:child_process";
@@ -58,20 +58,46 @@ function homeDir() {
 }
 
 // --- 注入 ------------------------------------------------------------------------
+function statOf(fp) {
+  try { const s = statSync(fp); return `${s.size}:${s.mtimeMs}`; } catch { return "missing"; }
+}
+
+function writeAtomic(fp, data) {
+  const tmp = `${fp}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    writeFileSync(tmp, data, "utf8");
+    renameSync(tmp, fp);
+  } catch {
+    try { unlinkSync(tmp); } catch {}
+    writeFileSync(fp, data, "utf8");
+  }
+}
+
 function patchHtml(indexPath) {
-  const html = readFileSync(indexPath, "utf8");
   const backupPath = join(dirname(indexPath), BACKUP_NAME);
   // 备份内容 = 当前页面去掉本插件注入行，每次打补丁跟随刷新：应用自动更新覆盖
   // index.html、或另一插件（如 usage-union）增删注入后，备份仍是干净基线，
   // 卸载时不会恢复出过期页面或指向已删除脚本的 ghost 标签。
   // script 标签带 ?v=版本号：app:// 协议对同 URL 资源有缓存，升级必须换 URL。
-  const clean = html.split("\n").filter((l) => !l.includes(SCRIPT_NAME)).join("\n");
-  if (!clean.includes("</body>")) throw new Error("index.html 结构异常");
-  let cur = null;
-  try { cur = readFileSync(backupPath, "utf8"); } catch {}
-  if (cur !== clean) writeFileSync(backupPath, clean, "utf8");
-  const scriptTag = `    <script src="/assets/${SCRIPT_NAME}?v=${lib.VERSION}"></script>\n`;
-  writeFileSync(indexPath, clean.replace("</body>", `${scriptTag}</body>`), "utf8");
+  //
+  // index.html 是多个插件的公共注入点，且 app:// 协议对每个请求实时读盘。
+  // 「读前后 stat 校验 + 原子写 + 写后复验 + 有限重试」的乐观并发：撞上其他
+  // 插件/应用自身的并发写时重读重算，收敛于包含所有人标签的最新内容。
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const s1 = statOf(indexPath);
+    const html = readFileSync(indexPath, "utf8");
+    if (statOf(indexPath) !== s1) continue;   // 读期间文件在变，重读
+    const clean = html.split("\n").filter((l) => !l.includes(SCRIPT_NAME)).join("\n");
+    if (!clean.includes("</body>")) throw new Error("index.html 结构异常");
+    let cur = null;
+    try { cur = readFileSync(backupPath, "utf8"); } catch {}
+    if (cur !== clean) writeAtomic(backupPath, clean);
+    const scriptTag = `    <script src="/assets/${SCRIPT_NAME}?v=${lib.VERSION}"></script>\n`;
+    writeAtomic(indexPath, clean.replace("</body>", `${scriptTag}</body>`));
+    // 写后复验：若被并发写覆盖丢了我们的标签，下一轮重试会基于最新内容补回
+    if (readFileSync(indexPath, "utf8").includes(SCRIPT_NAME)) return;
+  }
+  throw new Error("index.html 并发写入冲突，重试耗尽（下次会话自动重试）");
 }
 
 function injectUI(dist) {
@@ -83,7 +109,7 @@ function injectUI(dist) {
   const patched = html.includes(SCRIPT_NAME);
   const stale = !existsSync(runtimePath) || !readFileSync(runtimePath, "utf8").includes(`auto-memory@${lib.VERSION}`);
   if (patched && !stale && !has("--force")) return false;
-  writeFileSync(runtimePath, `/* auto-memory@${lib.VERSION} */\n` + template, "utf8");
+  writeAtomic(runtimePath, `/* auto-memory@${lib.VERSION} */\n` + template);
   // 升级时也重写标签：?v= 随版本变化，绕过 app:// 的脚本缓存
   patchHtml(indexPath);
   return true;
@@ -93,11 +119,11 @@ function uninstallDist(dist) {
   const indexPath = join(dist, "index.html");
   const backupPath = join(dist, BACKUP_NAME);
   if (existsSync(backupPath)) {
-    copyFileSync(backupPath, indexPath);
+    writeAtomic(indexPath, readFileSync(backupPath, "utf8"));
     rmSync(backupPath, { force: true });
   } else if (existsSync(indexPath)) {
     const html = readFileSync(indexPath, "utf8");
-    writeFileSync(indexPath, html.split("\n").filter((l) => !l.includes(SCRIPT_NAME)).join("\n"), "utf8");
+    writeAtomic(indexPath, html.split("\n").filter((l) => !l.includes(SCRIPT_NAME)).join("\n"));
   }
   rmSync(join(dist, "assets", SCRIPT_NAME), { force: true });
   rmSync(join(dist, "assets", CONFIG_NAME), { force: true });
@@ -112,24 +138,26 @@ async function ping(port) {
 }
 
 async function ensureSidecar(dist) {
-  // 已有同版本实例在跑就不动；版本不一致（插件升级后）继续走拉起流程——
-  // 新实例会占用下一个端口并重写 config，旧实例的自愈守卫会让位退出。
+  // 只复用 config 指向的健康实例。config 缺失/指向死端口/版本不一致时，
+  // 一律拉起新实例：新实例绑定下一个端口并重写 config，旧实例按 pid 看门狗
+  // 让位退出。（旧的"任一同版本实例即复用"在 config 陈旧时会留下健康实例 +
+  // 坏 config 的死局：面板连不上，实例自己随后退出。）
   // 并行探测：串行最坏 11×400ms≈4.4s，加上拉起等待可能顶到 hook 的 15s 超时
   const ports = [];
   for (let p = 39471; p < 39482; p++) ports.push(p);
   const hits = await Promise.all(ports.map(ping));
-  let anyRunning = false;
-  for (let i = 0; i < ports.length; i++) {
-    if (hits[i]) {
-      if (hits[i].version === lib.VERSION) return { running: true, port: ports[i], spawned: false };
-      anyRunning = true;
-    }
+  let cfg = null;
+  try { cfg = JSON.parse(readFileSync(join(dist, "assets", CONFIG_NAME), "utf8")); } catch {}
+  if (cfg && Number.isInteger(cfg.port)) {
+    const i = ports.indexOf(cfg.port);
+    if (i >= 0 && hits[i]?.version === lib.VERSION) return { running: true, port: cfg.port, spawned: false };
   }
-  if (has("--no-spawn")) return { running: anyRunning, spawned: false };
+  if (has("--no-spawn")) return { running: hits.some(Boolean), spawned: false };
   const assetsDir = join(dist, "assets");
   const child = spawn(process.execPath, [join(HERE, "sidecar.mjs")], {
     detached: true,
     stdio: "ignore",
+    cwd: homedir(),   // 别让子进程把 CWD 带进插件目录，否则引擎安装/升级 rename 会 EBUSY
     env: { ...process.env, AUTO_MEMORY_ASSETS: assetsDir },
     windowsHide: true,
   });
@@ -223,6 +251,8 @@ async function main() {
       const r = await su.selfUpdate({
         repo: REPO, pluginRoot: PLUGIN_ROOT, currentVersion: lib.VERSION,
         log: say, force: has("--check-update"),
+        // hook 总时长 15s：留 3s 余量，预算耗尽时放弃交换绝不被杀在中间态
+        deadline: quiet ? startedAt + 12_000 : undefined,
       });
       if (r?.applied) say(`auto-memory: 已自动更新到 v${r.version}，下次会话生效`);
       else if (r?.reason && (has("--check-update") || has("--status"))) say(`auto-memory: 更新检查：${r.latest ?? r.reason}`);
